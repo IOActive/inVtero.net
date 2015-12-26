@@ -18,6 +18,7 @@
 using ProtoBuf;
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Text;
 
 namespace inVtero.net
@@ -45,7 +46,7 @@ namespace inVtero.net
     public struct VIRTUAL_ADDRESS
     {
         public override string ToString() => $"Addr: {Address:X16}, PML4E {PML4:X4}, DirectoryPointerOffset:{DirectoryPointerOffset:X4}, DirectoryOffset:{DirectoryOffset:X4}, TableOffset: {TableOffset:X4}, Offset: {Offset:X4}";
-
+        [ProtoMember(1)]
         public long Address;
         public VIRTUAL_ADDRESS(long VA) { Address = VA; }
         public long Offset { get { return Address & 0xfff; } set { Address = (value | (Address & ~0xfffu)); } }
@@ -124,7 +125,7 @@ namespace inVtero.net
         }
 
         public HARDWARE_ADDRESS_ENTRY(long pte) { PTE = pte; }
-        public bool Valid { get { return (PTE & 1) != 0; } }
+        public bool Valid { get { return (PTE & 1) != 0; } set { if (value) PTE |= 1; else PTE &= ~1; } }
         public bool Dirty1 { get { return (PTE & 2) != 0; } }
         public bool Owner { get { return (PTE & 4) != 0; } }
         public bool WriteThrough { get { return (PTE & 8) != 0; } }
@@ -250,25 +251,57 @@ namespace inVtero.net
     /// <summary>
     /// Run's allow for gaps in address space
     /// </summary>
+    [ProtoContract]
     public class MemoryRun
     {
+        [ProtoMember(1)] // 
         public long BasePage;
+        [ProtoMember(2)]
         public long PageCount;
+        [ProtoMember(3)] // physical page number
+        public long regionPPN;
+
+        public override string ToString()
+        {
+            return $"BasePage: {BasePage:X16} PageCount: {PageCount:X16} PhysicalPageNumber {regionPPN:X16}";
+        }
     }
     /// <summary>
     /// Setup one default memory run for the entire range
     /// </summary>
+    [ProtoContract]
     public class MemoryDescriptor
     {
-        public int NumberOfRuns;
+        [ProtoMember(1)]
+        public long StartOfMemmory; // this object does not have to be a 1:1 to the native type
+        [ProtoMember(2)]
+        public long NumberOfRuns;
+        [ProtoMember(3)]
         public long NumberOfPages;
+
+        [ProtoMember(4)]
+        long maxAddressablePageNumber;
+        public long MaxAddressablePageNumber { get {
+
+                if (maxAddressablePageNumber != 0)
+                    return maxAddressablePageNumber;
+
+                maxAddressablePageNumber = Run.Count > 0 ? Run[Run.Count - 1].BasePage + Run[Run.Count - 1].BasePage : NumberOfPages;
+                return maxAddressablePageNumber;
+            } }
+        [ProtoMember(5)]
         public List<MemoryRun> Run;
-        public MemoryDescriptor(long MemSize)
+
+        public MemoryDescriptor()
+        {
+            Run = new List<MemoryRun>();
+        }
+
+        public MemoryDescriptor(long MemSize) : this()
         {
             NumberOfPages = MemSize / 4096;
             NumberOfRuns = 1;
 
-            Run = new List<MemoryRun>();
             Run.Add(new MemoryRun { BasePage = 0, PageCount = NumberOfPages });
         }
     }

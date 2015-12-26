@@ -17,27 +17,27 @@
 
 // Shane.Macaulay@IOActive.com (c) copyright 2014,2015 all rights reserved. GNU GPL License
 //  
-// Version 2.1-Post-RuxCon-DefCon-CanSecWest! thanks conferences for allowing people to do something not related to dayjobs!!!
+// Version 2.1-Post-RuxCon-DefCon-CanSecWest! thanks conferences for allowing people to do something not related to day jobs!!!
 //  + Fixed few bugs after the conference's
-//  + Works as VMI insteads of single OS process detection
+//  + Works as VMI instead of single OS process detection
 //  + Easier to use & find EPTP
 //  + Ported to BSD families -- in terms of functional fbsd/obsd/nbsd (i.e. nbsd is a bit cranky, need to work on that one ;)
-//  + Parallized some of the operation if your runtime is concurrent (serial versions still around for lame runtimes)
+//  + Parallelized some of the operation if your runtime is concurrent (serial versions still around for lame run times)
 //  + CR3 dumping
 // 
 //  TODO:   * PERF!
 //              - memory mapper should improve with windowing larger sizes (basic single page maps currently)
-//              - pre-cache full tables in one shot (don't traverse V2gP2hV every time, 24 read's per load)
+//              - pre-cache full tables in one shot (don't traverse V2gP2hV every time, 24 reads per load)
 //              - testing against other tools (ensure dump is accurate & best performing ;)
 //          
-//          * BlockWatch server intergration - Eliminate gaps in your memory forensic process. 
+//          * BlockWatch server integration - Eliminate gaps in your memory forensic process. 
 //              - Isolate known code from unknown/untrusted code in memory. e.g. 99%+ of resident code can be securely identified (based on cryptographic secure hashes 192bit+)
-//              - (If your not verifying the code in your memory dumps, you really don't know what's in them do you? -- that string that say's ntdll.dll cant lie right!! :)
+//              - (If your not verifying the code in your memory dumps, you really don't know what's in them do you? -- that string that says ntdll.dll cant lie right!! :)
 //              - Delocate memory based on hosted .reloc files (don't you want to memory dumps that match disk files?!?!)
-//              - Match dumped binaries to known secure hashes (who want's to dissassemble/analyze ntdll when you dont have too!)
+//              - Match dumped binaries to known secure hashes (who wants to dissassemble/analyze ntdll when you dont have too!)
 //              
-//          ~~* Test/Support open .net runtimes Rosylin and such on other platforms (done see Reloc)~~
-//              ~~- Now that WCF is open, it's a sinch to connect to our web services~~
+//          ~~* Test/Support open .net runtime Roselin and such on other platforms (done see Reloc)~~
+//              ~~- Now that WCF is open, it's a cinch to connect to our web services~~
 //
 //          * Memory run detection
 //              - Validate top level page references and auto extend for raw, still tbd bitmap dmp for Windows
@@ -46,11 +46,11 @@
 // TODO:PageTable.cs
 //~~          + group/associate CR3's which belong together and are under the control of a given EPTP
 //              + can group by identifying shared kernel PTE entries e.g. all processes & kernel share most significant kernel entries (done) ~~
-//          + Cache tables into internal/peformance representation
+//          + Cache tables into internal/performance representation
 //              + PreLoad EPTP references into direct addresses
 //      Dumper.cs
-//          + Dump available pages into filesystem 
-//          + Group by permission's and contigious regions
+//          + Dump available pages into file system 
+//          + Group by permission's and contiguous regions
 //
 
 using inVtero.net;
@@ -78,9 +78,10 @@ namespace quickdumps
         {
             #region fluff
             var Version = PTType.UNCONFIGURED;
-            string Filename = string.Empty;
+            var Filename = string.Empty;
+            var SkipVMCS = false;
 
-            if (args.Length == 0 || args.Length > 2)
+            if (args.Length < 1)
             {
                 PrintHelp();
                 return;
@@ -115,7 +116,8 @@ namespace quickdumps
                         Version |= PTType.ALL;
 
                     if (spec.Contains("-vmcs"))
-                        Version = Version & ~PTType.VMCS;
+                        SkipVMCS = true;
+
                     if (spec.Contains("-obsd"))
                         Version = Version & ~PTType.OpenBSD;
                     if (spec.Contains("-nbsd"))
@@ -130,7 +132,25 @@ namespace quickdumps
                 else
                     Version = PTType.ALL;
 
-                var vtero = new Vtero(Filename);
+                Vtero vtero = null;
+
+                var saveStateFile = $"{Filename}.inVtero.net";
+
+                if (File.Exists(saveStateFile))
+                {
+                    WriteLine("Found save state, (l)oad or (d)iscard?");
+                    var todo = ReadKey();
+                    if (todo.Key == ConsoleKey.L)
+                    {
+                        vtero = Vtero.CheckpointRestoreState(saveStateFile);
+                        vtero.OverRidePhase = true;
+                    }
+                    else
+                        File.Delete(saveStateFile);
+                }
+
+                if(vtero == null)
+                    vtero = new Vtero(Filename);
 
                 Vtero.VerboseOutput = true;
                 
@@ -158,14 +178,14 @@ namespace quickdumps
                 ForegroundColor = ConsoleColor.Cyan;
                 if (procCount < 3)
                 {
-                    WriteLine("Seems like a fail. Try generic scanning or implment a state scan like LinuxS");
+                    WriteLine("Seems like a fail. Try generic scanning or implement a state scan like LinuxS");
                     return;
                 }
                 //BackgroundColor = ConsoleColor.White;
                 #endregion
                 #region blighering
                 // second pass
-                // with the page tables we aquired, locate candidate VMCS pages in the format
+                // with the page tables we acquired, locate candidate VMCS pages in the format
                 // [31-bit revision id][abort indicator]
                 // the page must also have at least 1 64bit value which is all set (-1)
                 // Root-HOST CR3 will have uniform diff
@@ -177,7 +197,7 @@ namespace quickdumps
                 // future may have a reason to isolate based on original locationAG
                 #endregion
 
-                if ((Version & PTType.VMCS) == PTType.VMCS)
+                if (!SkipVMCS)
                 {
                     var VMCSCount = vtero.VMCSScan();
 
@@ -192,21 +212,35 @@ namespace quickdumps
                     Write($"Data scanned: {vtero.FileSize:N}");
 
                     // second time 
-                    WriteLine("Second pass done. " + FormatRate(vtero.FileSize * 2, Timer.Elapsed));
+                    WriteLine($"Second pass done. {FormatRate(vtero.FileSize * 2, Timer.Elapsed)}");
                     BackgroundColor = ConsoleColor.Black;
                     ForegroundColor = ConsoleColor.Cyan;
                     
                     #region TEST
                     // each of these depends on a VMCS scan/pass having been done at the moment
-                    WriteLine("grouping and joinging all memory");
+                    WriteLine("grouping and joining all memory");
 
                     vtero.GroupAS();
 
-                    vtero.ExtrtactAddressSpaces();
+                    // sync-save state so restarting is faster
+                    if (!File.Exists(saveStateFile))
+                    {
+                        Write($"Saving checkpoint... ");
+                        saveStateFile = vtero.CheckpointSaveState();
+                        WriteLine(saveStateFile);
+                    }
 
-                    vtero.DumpASToFile();
+                    // Extract Address Spaces verifies the linkages between
+                    // process<->CR3<->EPTP(if there is one)
+                    // and that they are functional
+                    var vetted = vtero.ExtrtactAddressSpaces();
+                    
+                    // do a test dump
+                    // extract & dump could be done at the same time
+                    vtero.DumpASToFile(vetted);
 
-                    vtero.DumpFailList();
+                    if (Vtero.VerboseOutput)
+                        vtero.DumpFailList();
 
                     WriteLine($"Final analysis compleated, address spaces extracted. {Timer.Elapsed} {FormatRate(vtero.FileSize * 3, Timer.Elapsed)}");
                 }

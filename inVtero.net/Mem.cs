@@ -21,8 +21,12 @@ using System.IO;
 using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Threading;
+
+using RaptorDB;
+using System.Collections.Concurrent;
+
 // Details on this struct can be found here and likely many other sources
-// Microsoft published this origionally on the singularity project's codeplex (along with some other ingerestiVng things)
+// Microsoft published this originally on the singularity project's codeplex (along with some other ingerestiVng things)
 //      http://volatility.googlecode.com/svn-history/r2779/branches/scudette/tools/windows/winpmem/executable/Dump.h
 //          //  Microsoft Research Singularity
 //          typedef struct _PHYSICAL_MEMORY_RUN64
@@ -42,49 +46,99 @@ namespace inVtero.net
     /// <summary>
     /// Physical to Virtual and Physical to Hypervisor Guest Virtual memory dump class
     /// 
-    /// Convienent generic interfaces for extracting preferred types
+    /// Convenient generic interfaces for extracting preferred types
     ///     * Type has to be a value/struct type and is expected to be 64 bits width
-    ///     * TODO: Adjust for other size structs & values stradling page boundries
+    ///     * TODO: Adjust for other size struts & values straddling page boundaries
     /// </summary>
     public class Mem : IDisposable
     {
+        MemoryDescriptor ddes;
+        /// <summary>
+        /// DetectedDescriptor is meant for the user to assign when they have an override
+        /// </summary>
+        public MemoryDescriptor DetectedDescriptor { get { return ddes; } set { ddes = value; MD = value; } }
+
+        /// <summary>
+        /// MD actually gets used for extracting memory
+        /// </summary>
+        MemoryDescriptor MD;
+
+
         public long StartOfMemory; // adjust for .DMP headers or something
         public long GapScanSize;   // auto-tune for seeking gaps default is 0x10000000 
+
+        const int PageCacheMax = 100000;
+        static ConcurrentDictionary<long, long[]> PageCache;
 
         IDictionary<long, long> DiscoveredGaps;
 
         MemoryMappedViewAccessor mappedAccess;
         MemoryMappedFile mappedFile;
         FileStream mapStream;
-        public MemoryDescriptor MD;
 
         string MemoryDump;
         long FileSize;
 
-        const int PAGE_SIZE = 0x1000;
+        const long PAGE_SIZE = 0x1000;
         static int mindex = 0;
 
         long MapWindowSize;
         long MapViewBase;
         long MapViewSize;
 
-        public Mem(String mFile)
+        WAHBitArray pfnTableIdx;
+        public void DumpPFNIndex()
+        {
+            if (!Vtero.VerboseOutput)
+                return;
+
+            var idx = pfnTableIdx.GetBitIndexes();
+            int i = 0;
+
+            Console.WriteLine("Dumping PFN index");
+            foreach (var pfn in idx)
+            {
+                Console.Write("{pfn:X8} ");
+                i += 8;
+                if (i >= Console.WindowWidth - 7)
+                    Console.Write(Environment.NewLine);
+            }
+        }
+
+        public Mem(String mFile, uint[] BitmapArray = null, MemoryDescriptor Override = null)
         {
             GapScanSize = 0x10000000;
-            StartOfMemory = 0;
+            StartOfMemory = Override != null ? Override.StartOfMemmory : 0;
 
-            MapViewBase = 0;                                      // BUGBUG: Track down windowing issues not working 
-                                                                  // as efficently as it needs to
-            MapViewSize = MapWindowSize = (0x1000 * 0x1000 * 32); // pretty huge still, 512MB 
+            MapViewBase = 0;                                      
+            MapViewSize = MapWindowSize = (0x1000 * 0x1000 * 4); // Due to the physical page allocation algorithm a modest window is probably fine 
 
+            // so not even 1/2 the size of the window which was only getting < 50% hit ratio at best
+            // PageCache may be better off than a huge window...
+            if (PageCache == null)
+                PageCache = new ConcurrentDictionary<long, long[]>(8, PageCacheMax); 
+
+            if (BitmapArray != null)
+                pfnTableIdx = new WAHBitArray(WAHBitArray.TYPE.Bitarray, BitmapArray);
+            else
+                pfnTableIdx = new WAHBitArray();
+
+            // 32bit's of pages should be plenty?
+            pfnTableIdx.Length = (int) (MapViewSize / 0x1000);
 
             if (File.Exists(mFile))
             {
 
                 MemoryDump = mFile;
                 FileSize = new FileInfo(MemoryDump).Length;
-                MD = new MemoryDescriptor(FileSize);
 
+                if (Override != null)
+                    MD = Override;
+                else {
+                    MD = new MemoryDescriptor(FileSize);
+                    if (DetectedDescriptor != null)
+                        MD = DetectedDescriptor;
+                }
                 MapViewSize = FileSize < MapWindowSize ? FileSize : MapWindowSize;
 
                 var lmindex = Interlocked.Increment(ref mindex);
@@ -122,6 +176,12 @@ namespace inVtero.net
             var CheckBase = FileOffset / MapViewSize;
             if (MapViewBase != CheckBase * MapViewSize)
                 NewMapViewBase = CheckBase * MapViewSize;
+
+            if (FileOffset > FileSize)
+                return 0;
+
+            if (FileOffset < NewMapViewBase)
+                throw new OverflowException("FileOffset must be >= than base");
 
             var AbsOffset = FileOffset - NewMapViewBase;
             var BlockOffset = AbsOffset & ~(PAGE_SIZE - 1);
@@ -162,12 +222,24 @@ namespace inVtero.net
         }
 
         // Extract a single page of data from a physical address in source dump
-        // accout for memory gaps/run layout
-        // TODO: Add windowing currently uses naieve single-page-at-a-time view
+        // account for memory gaps/run layout
+        // TODO: Add windowing currently uses naive single-page-at-a-time view
         public long GetPageForPhysAddr(HARDWARE_ADDRESS_ENTRY PAddr, ref long[] block) 
         {
             // convert PAddr to PFN
             var PFN = PAddr.NextTable_PFN;
+
+            if (PageCache.ContainsKey(PFN))
+            {
+                if (PageCache.TryGetValue(PAddr, out block))
+                    return block[PAddr & 0x1ff];
+            }
+
+            // record our access attempt to the pfnIndex
+            if (PFN > int.MaxValue || PFN > MD.MaxAddressablePageNumber)
+                return 0;
+
+            pfnTableIdx.Set((int)PFN, true);
 
             // paranoid android setting
             var Fail = true;
@@ -190,8 +262,13 @@ namespace inVtero.net
             // Determine file offset based on indexed/gap adjusted PFN and page size
             var FileOffset = StartOfMemory + (IndexedPFN * PAGE_SIZE);
 
-            // add back in the file offset for possiable exact byte lookup
-            return GetPageFromFileOffset(FileOffset + PAddr.AddressOffset, ref block);
+            // add back in the file offset for possible exact byte lookup
+            var rv = GetPageFromFileOffset(FileOffset + PAddr.AddressOffset, ref block);
+
+            if(block != null)
+                PageCache.TryAdd(PFN, block);
+
+            return rv;
         }
 
 
@@ -232,7 +309,7 @@ namespace inVtero.net
                         if (!PDPTE.LargePage)
                         {
                             Attempted = PDPTE.NextTableAddress | (va.DirectoryOffset << 3);
-                            var PDE = (HARDWARE_ADDRESS_ENTRY) GetValueAtPhysicalAddr(Attempted);
+                            var PDE = (HARDWARE_ADDRESS_ENTRY)GetValueAtPhysicalAddr(Attempted);
                             ConvertedV2P.Add(PDE);
                             //Console.WriteLine($"PDE = {PDE.PTE:X16}");
 
@@ -241,36 +318,48 @@ namespace inVtero.net
                                 if (!PDE.LargePage)
                                 {
                                     Attempted = PDE.NextTableAddress | (va.TableOffset << 3);
-                                    var PTE = (HARDWARE_ADDRESS_ENTRY) GetValueAtPhysicalAddr(Attempted);
+                                    var PTE = (HARDWARE_ADDRESS_ENTRY)GetValueAtPhysicalAddr(Attempted);
                                     ConvertedV2P.Add(PTE);
                                     //Console.WriteLine($"PTE = {PTE.PTE:X16}");
 
                                     // page is normal 4kb
                                     if (PTE.Valid)
                                         rv = PTE.NextTableAddress | va.Offset;
+                                    else
+                                        rv.Valid = false;
                                 }
                                 else
                                 {   // we have a 2MB page
                                     rv = (PDE.PTE & 0xFFFFFFE00000) | (Addr & 0x1FFFFF);
                                 }
                             }
+                            else
+                                rv.Valid = false;
                         }
                         else
                         {   // we have a 1GB page
                             rv = (PDPTE.PTE & 0xFFFFC0000000) | (Addr & 0x3FFFFFFF);
                         }
                     }
+                    else
+                        rv.Valid = false;
                 }
+                else
+                    rv.Valid = false;
             }
             catch (Exception ex)
             {
                 throw new PageNotFoundException("V2P conversion error page not found", Attempted, ConvertedV2P, ex);
             }
-            
+            finally
+            {
+                foreach(var paddr in ConvertedV2P)
+                {
+
+                }
+            }
             //Console.WriteLine($"return from V2P {rv:X16}");
             // serialize the dictionary out
-
-
             return rv;
         }
 
@@ -449,7 +538,7 @@ namespace inVtero.net
     {
         public long PageRunNumber;
         public MemoryRunMismatchException()
-            : base("Examine Mem:MemoryDescriptor to determine why the requested PFN (page run number) wsa not present. Inaccurate gap list creation/walking is typiaclly to blame.")
+            : base("Examine Mem:MemoryDescriptor to determine why the requested PFN (page run number) was not present. Inaccurate gap list creation/walking is typiaclly to blame.")
         { }
         public MemoryRunMismatchException(long pageRunNumber) : this()
         {
